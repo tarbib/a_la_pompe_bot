@@ -30,6 +30,11 @@ STATE_FILE = Path("/app/data/state.json")
 
 API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-des-carburants-en-france-flux-instantane-v2/records"
 
+# Le flux "instantané" ci-dessus ne contient pas le nom/enseigne de la station.
+# Ce jeu de données quotidien (J-1) officiel le contient : on l'utilise uniquement
+# comme annuaire nom/marque (qui ne change pas d'un jour à l'autre), jamais pour les prix.
+BRAND_API_URL = "https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/prix-des-carburants-j-1/records"
+
 # Nom du carburant -> (libellé affiché, champ prix, champ date de maj)
 FUELS = {
     "gazole": {"label": "Gazole", "prix": "gazole_prix", "maj": "gazole_maj"},
@@ -117,6 +122,75 @@ def refresh_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Rafraîchir", callback_data="refresh")]])
 
 
+def find_available_fuels(codes):
+    """Interroge l'API sans filtrer par carburant pour voir ce qui est réellement
+    disponible dans ces codes postaux (utilisé quand un carburant ne renvoie rien)."""
+    where_codes = " or ".join(f'cp="{cp}"' for cp in codes)
+    prix_fields = ",".join(f["prix"] for f in FUELS.values())
+
+    params = {
+        "where": f"({where_codes})",
+        "select": f"id,{prix_fields}",
+        "limit": 100,
+        "timezone": "Europe/Paris",
+    }
+
+    try:
+        response = requests.get(API_URL, params=params, timeout=15)
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"API request failed: {e}")
+        return None
+
+    if response.status_code != 200:
+        return None
+
+    results = response.json().get("results", [])
+    if not results:
+        return set()  # aucune station du tout dans ces codes postaux
+
+    available = set()
+    for r in results:
+        for code, f in FUELS.items():
+            if r.get(f["prix"]) is not None:
+                available.add(code)
+    return available
+
+
+def fetch_station_brands(codes):
+    """Recherche best-effort du nom/enseigne des stations via le jeu de données
+    quotidien (J-1), qui contient ces informations contrairement au flux instantané.
+
+    Utilise le paramètre de recherche plein texte 'q' (plutôt qu'un filtre 'where'
+    sur un nom de champ précis) pour rester robuste si les noms techniques des
+    champs diffèrent de ceux devinés. Ne lève jamais d'exception : renvoie {} en
+    cas d'échec, auquel cas les prix s'affichent simplement sans enseigne.
+    """
+    brands = {}
+    id_keys = ("identifiant_station", "id_station", "id", "identifiant", "id_pdv")
+    name_keys = ("marque", "nom")
+
+    for cp in codes:
+        params = {"q": cp, "limit": 50, "timezone": "Europe/Paris"}
+        try:
+            response = requests.get(BRAND_API_URL, params=params, timeout=10)
+            if response.status_code != 200:
+                continue
+            results = response.json().get("results", [])
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"Brand lookup failed for {cp}: {e}")
+            continue
+
+        for r in results:
+            station_id = next((str(r[k]) for k in id_keys if r.get(k)), None)
+            if not station_id:
+                continue
+            label = next((r[k] for k in name_keys if r.get(k)), None)
+            if label:
+                brands[station_id] = label
+
+    return brands
+
+
 def build_prices_message(codes, fuel_code):
     """Interroge l'API et construit le message texte trié du moins cher au plus cher."""
     fuel = FUELS[fuel_code]
@@ -147,12 +221,32 @@ def build_prices_message(codes, fuel_code):
 
     if not results:
         codes_str = ", ".join(codes)
-        return (
-            f"😕 Aucune station trouvée avec du *{fuel['label']}* "
-            f"pour le(s) code(s) postal(aux) : {codes_str}."
+        available = find_available_fuels(codes)
+
+        if available is None:
+            # La requête de vérification a échoué, on garde un message simple
+            return (
+                f"😕 Aucune station trouvée avec du *{fuel['label']}* "
+                f"pour le(s) code(s) postal(aux) : {codes_str}."
+            )
+
+        if not available:
+            return (
+                f"😕 Aucune station-service référencée pour le(s) code(s) postal(aux) : "
+                f"{codes_str}.\nVérifiez le(s) code(s) postal(aux) ou essayez une ville voisine."
+            )
+
+        autres = ", ".join(FUELS[c]["label"] for c in sorted(available))
+        message = (
+            f"😕 Aucune station ne déclare de *{fuel['label']}* pour {codes_str} en ce moment.\n\n"
+            f"⛽ Carburants disponibles dans ce secteur : {autres}."
         )
+        if fuel_code == "sp95":
+            message += "\n💡 Le SP95 « classique » est de plus en plus remplacé par le E10 dans les stations."
+        return message
 
     medals = ["🥇", "🥈", "🥉"]
+    brands = fetch_station_brands(codes)
     lines = [f"⛽ *Prix du {fuel['label']}* ⛽\n"]
 
     for i, r in enumerate(results):
@@ -162,9 +256,12 @@ def build_prices_message(codes, fuel_code):
         adresse = r.get("adresse") or "Adresse inconnue"
         ville = r.get("ville") or ""
         cp = r.get("cp") or ""
+        station_id = str(r.get("id") or "")
+        brand = brands.get(station_id)
         prix_str = f"{prix:.3f}".replace(".", ",")
         marker = medals[i] if i < len(medals) else "▪️"
-        lines.append(f"{marker} *{prix_str} €* — {adresse}, {cp} {ville}")
+        prefix = f"{brand} — " if brand else ""
+        lines.append(f"{marker} *{prix_str} €* — {prefix}{adresse}, {cp} {ville}")
 
     lines.append("\n🕒 Données mises à jour toutes les 10 minutes (source : gouvernement).")
     return "\n".join(lines)
