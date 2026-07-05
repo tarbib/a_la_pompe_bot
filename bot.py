@@ -9,6 +9,7 @@ plus cher. Les préférences sont sauvegardées dans un fichier JSON.
 import os
 import re
 import json
+import time
 import logging
 import requests
 from pathlib import Path
@@ -31,9 +32,13 @@ STATE_FILE = Path("/app/data/state.json")
 API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-des-carburants-en-france-flux-instantane-v2/records"
 
 # Le flux "instantané" ci-dessus ne contient pas le nom/enseigne de la station.
-# Ce jeu de données quotidien (J-1) officiel le contient : on l'utilise uniquement
-# comme annuaire nom/marque (qui ne change pas d'un jour à l'autre), jamais pour les prix.
-BRAND_API_URL = "https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/prix-des-carburants-j-1/records"
+# Cet annuaire communautaire (maintenu sur GitHub) fait la correspondance
+# id de station -> {"name":..., "brand":...} avec les mêmes identifiants que
+# ceux utilisés par le flux officiel. On le télécharge une fois et on le
+# garde en cache (le nom d'une station ne change quasiment jamais).
+BRANDS_URL = "https://raw.githubusercontent.com/Aohzan/hass-prixcarburant/master/custom_components/prix_carburant/stations_name.json"
+BRANDS_CACHE_TTL = 24 * 3600  # 24h
+_brands_cache = {"data": {}, "fetched_at": 0}
 
 # Nom du carburant -> (libellé affiché, champ prix, champ date de maj)
 FUELS = {
@@ -156,39 +161,24 @@ def find_available_fuels(codes):
     return available
 
 
-def fetch_station_brands(codes):
-    """Recherche best-effort du nom/enseigne des stations via le jeu de données
-    quotidien (J-1), qui contient ces informations contrairement au flux instantané.
+def get_station_brands():
+    """Renvoie le dictionnaire {id_station: {"name":..., "brand":...}}, avec un
+    cache de 24h. Ne lève jamais d'exception : en cas d'échec réseau, renvoie
+    le cache existant (ou {} au tout premier échec), et les prix s'affichent
+    simplement sans enseigne."""
+    now = time.time()
+    if _brands_cache["data"] and (now - _brands_cache["fetched_at"] < BRANDS_CACHE_TTL):
+        return _brands_cache["data"]
 
-    Utilise le paramètre de recherche plein texte 'q' (plutôt qu'un filtre 'where'
-    sur un nom de champ précis) pour rester robuste si les noms techniques des
-    champs diffèrent de ceux devinés. Ne lève jamais d'exception : renvoie {} en
-    cas d'échec, auquel cas les prix s'affichent simplement sans enseigne.
-    """
-    brands = {}
-    id_keys = ("identifiant_station", "id_station", "id", "identifiant", "id_pdv")
-    name_keys = ("marque", "nom")
+    try:
+        response = requests.get(BRANDS_URL, timeout=10)
+        if response.status_code == 200:
+            _brands_cache["data"] = response.json()
+            _brands_cache["fetched_at"] = now
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Could not refresh station brands directory: {e}")
 
-    for cp in codes:
-        params = {"q": cp, "limit": 50, "timezone": "Europe/Paris"}
-        try:
-            response = requests.get(BRAND_API_URL, params=params, timeout=10)
-            if response.status_code != 200:
-                continue
-            results = response.json().get("results", [])
-        except (requests.exceptions.RequestException, ValueError) as e:
-            logger.warning(f"Brand lookup failed for {cp}: {e}")
-            continue
-
-        for r in results:
-            station_id = next((str(r[k]) for k in id_keys if r.get(k)), None)
-            if not station_id:
-                continue
-            label = next((r[k] for k in name_keys if r.get(k)), None)
-            if label:
-                brands[station_id] = label
-
-    return brands
+    return _brands_cache["data"]
 
 
 def build_prices_message(codes, fuel_code):
@@ -246,7 +236,7 @@ def build_prices_message(codes, fuel_code):
         return message
 
     medals = ["🥇", "🥈", "🥉"]
-    brands = fetch_station_brands(codes)
+    brands = get_station_brands()
     lines = [f"⛽ *Prix du {fuel['label']}* ⛽\n"]
 
     for i, r in enumerate(results):
@@ -257,7 +247,8 @@ def build_prices_message(codes, fuel_code):
         ville = r.get("ville") or ""
         cp = r.get("cp") or ""
         station_id = str(r.get("id") or "")
-        brand = brands.get(station_id)
+        info = brands.get(station_id)
+        brand = info.get("brand") if info else None
         prix_str = f"{prix:.3f}".replace(".", ",")
         marker = medals[i] if i < len(medals) else "▪️"
         prefix = f"{brand} — " if brand else ""
