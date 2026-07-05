@@ -251,7 +251,7 @@ def build_prices_message(codes, fuel_code):
         cp = r.get("cp") or ""
         station_id = str(r.get("id") or "")
         info = brands.get(station_id)
-        brand = info.get("brand") if info else None
+        brand = info.get("Marque") or info.get("Nom") if info else None
         if not info:
             logger.info(f"No brand match for station id={station_id!r} ({adresse})")
         prix_str = f"{prix:.3f}".replace(".", ",")
