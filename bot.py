@@ -175,6 +175,9 @@ def get_station_brands():
         if response.status_code == 200:
             _brands_cache["data"] = response.json()
             _brands_cache["fetched_at"] = now
+            logger.info(f"Station brands directory loaded: {len(_brands_cache['data'])} entries")
+        else:
+            logger.warning(f"Brands directory fetch returned status {response.status_code}")
     except (requests.exceptions.RequestException, ValueError) as e:
         logger.warning(f"Could not refresh station brands directory: {e}")
 
@@ -249,6 +252,8 @@ def build_prices_message(codes, fuel_code):
         station_id = str(r.get("id") or "")
         info = brands.get(station_id)
         brand = info.get("brand") if info else None
+        if not info:
+            logger.info(f"No brand match for station id={station_id!r} ({adresse})")
         prix_str = f"{prix:.3f}".replace(".", ",")
         marker = medals[i] if i < len(medals) else "▪️"
         prefix = f"{brand} — " if brand else ""
