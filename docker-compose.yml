@@ -1,0 +1,9 @@
+services:
+  gas_price_bot:
+    build: .
+    container_name: prix_carburants_bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=XXXX  # Remplacez par votre token
+    volumes:
+      - ./:/app  # Monte le répertoire courant (dev + persistance des données utilisateurs)
