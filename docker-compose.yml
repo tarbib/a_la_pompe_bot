@@ -6,4 +6,4 @@ services:
     environment:
       - TELEGRAM_TOKEN=XXXX  # Remplacez par votre token
     volumes:
-      - ./:/app  # Monte le répertoire courant (dev + persistance des données utilisateurs)
+      - ./data:/app/data  # Monte le répertoire courant (dev + persistance des données utilisateurs)

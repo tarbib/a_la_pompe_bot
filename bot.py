@@ -1,8 +1,8 @@
 """
-Prix Carburants Bot - Suivi des prix des carburants en France par code postal.
+Prix Carburants Bot - Suivi des prix des carburants en France par code postal ou GPS.
 
-Chaque utilisateur définit ses codes postaux et son type de carburant,
-puis /prix renvoie les stations correspondantes triées du moins cher au
+Chaque utilisateur définit ses préférences de localisation (coordonnées GPS + rayon ou codes postaux)
+et son type de carburant, puis /prix renvoie les stations correspondantes triées du moins cher au
 plus cher. Les préférences sont sauvegardées dans un fichier JSON.
 """
 
@@ -14,7 +14,7 @@ import logging
 import requests
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,16 +31,11 @@ STATE_FILE = Path("/app/data/state.json")
 
 API_URL = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-des-carburants-en-france-flux-instantane-v2/records"
 
-# Le flux "instantané" ci-dessus ne contient pas le nom/enseigne de la station.
-# Cet annuaire communautaire (maintenu sur GitHub) fait la correspondance
-# id de station -> {"name":..., "brand":...} avec les mêmes identifiants que
-# ceux utilisés par le flux officiel. On le télécharge une fois et on le
-# garde en cache (le nom d'une station ne change quasiment jamais).
+# Annuaire de correspondance id de station -> {"name":..., "brand":...}
 BRANDS_URL = "https://raw.githubusercontent.com/Aohzan/hass-prixcarburant/master/custom_components/prix_carburant/stations_name.json"
 BRANDS_CACHE_TTL = 24 * 3600  # 24h
 _brands_cache = {"data": {}, "fetched_at": 0}
 
-# Nom du carburant -> (libellé affiché, champ prix, champ date de maj)
 FUELS = {
     "gazole": {"label": "Gazole", "prix": "gazole_prix", "maj": "gazole_maj"},
     "sp95": {"label": "SP95", "prix": "sp95_prix", "maj": "sp95_maj"},
@@ -91,7 +86,7 @@ def save_state(data):
 
 def get_user(state: dict, user_id: str) -> dict:
     """Return (and create if needed) a user's entry in state."""
-    return state.setdefault(user_id, {"codes": [], "carburant": None})
+    return state.setdefault(user_id, {"codes": [], "carburant": None, "lat": None, "lon": None, "radius": 10})
 
 
 # ── Helpers métier ─────────────────────────────────────────────────────────────
@@ -112,6 +107,15 @@ def parse_postal_codes(raw_tokens):
     return valid, invalid
 
 
+def welcome_keyboard():
+    """Clavier natif en bas de l'écran pour l'onboarding."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Envoyer ma position (ponctuel)", request_location=True)]],
+        resize_keyboard=True,
+        input_field_placeholder="Ou tapez /codes 44000..."
+    )
+
+
 def fuel_keyboard():
     codes = list(FUELS.items())
     rows = []
@@ -123,18 +127,48 @@ def fuel_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
+def radius_keyboard():
+    """Clavier Inline pour choisir le rayon d'action après envoi du GPS."""
+    buttons = [
+        [
+            InlineKeyboardButton("2 km", callback_data="radius_2"),
+            InlineKeyboardButton("5 km", callback_data="radius_5"),
+        ],
+        [
+            InlineKeyboardButton("10 km", callback_data="radius_10"),
+            InlineKeyboardButton("20 km", callback_data="radius_20"),
+        ],
+        [
+            InlineKeyboardButton("50 km", callback_data="radius_50"),
+        ]
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def refresh_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Rafraîchir", callback_data="refresh")]])
 
 
-def find_available_fuels(codes):
+def find_available_fuels(user):
     """Interroge l'API sans filtrer par carburant pour voir ce qui est réellement
-    disponible dans ces codes postaux (utilisé quand un carburant ne renvoie rien)."""
-    where_codes = " or ".join(f'cp="{cp}"' for cp in codes)
+    disponible dans la zone géographique de l'utilisateur."""
+    lat = user.get("lat")
+    lon = user.get("lon")
+    radius = user.get("radius", 10)
+    codes = user.get("codes", [])
+
+    if lat is not None and lon is not None:
+        where_clause = f"within_distance(geom, geom'POINT({lon} {lat})', {radius}km)"
+    elif codes:
+        where_codes = " or ".join(f'cp="{cp}"' for cp in codes)
+        where_clause = f"({where_codes})"
+    else:
+        return set()
+
     prix_fields = ",".join(f["prix"] for f in FUELS.values())
 
     params = {
-        "where": f"({where_codes})",
+        "where": where_clause,
         "select": f"id,{prix_fields}",
         "limit": 100,
         "timezone": "Europe/Paris",
@@ -151,7 +185,7 @@ def find_available_fuels(codes):
 
     results = response.json().get("results", [])
     if not results:
-        return set()  # aucune station du tout dans ces codes postaux
+        return set()
 
     available = set()
     for r in results:
@@ -162,10 +196,6 @@ def find_available_fuels(codes):
 
 
 def get_station_brands():
-    """Renvoie le dictionnaire {id_station: {"name":..., "brand":...}}, avec un
-    cache de 24h. Ne lève jamais d'exception : en cas d'échec réseau, renvoie
-    le cache existant (ou {} au tout premier échec), et les prix s'affichent
-    simplement sans enseigne."""
     now = time.time()
     if _brands_cache["data"] and (now - _brands_cache["fetched_at"] < BRANDS_CACHE_TTL):
         return _brands_cache["data"]
@@ -184,14 +214,26 @@ def get_station_brands():
     return _brands_cache["data"]
 
 
-def build_prices_message(codes, fuel_code):
-    """Interroge l'API et construit le message texte trié du moins cher au plus cher."""
+def build_prices_message(user, fuel_code):
+    """Interroge l'API et construit le message texte selon la position ou les CP."""
     fuel = FUELS[fuel_code]
     prix_field = fuel["prix"]
     maj_field = fuel["maj"]
 
-    where_codes = " or ".join(f'cp="{cp}"' for cp in codes)
-    where_clause = f"({where_codes}) and {prix_field} is not null"
+    lat = user.get("lat")
+    lon = user.get("lon")
+    radius = user.get("radius", 10)
+    codes = user.get("codes", [])
+
+    if lat is not None and lon is not None:
+        where_clause = f"within_distance(geom, geom'POINT({lon} {lat})', {radius}km) and {prix_field} is not null"
+        location_str = f"dans un rayon de {radius} km"
+    elif codes:
+        where_codes = " or ".join(f'cp="{cp}"' for cp in codes)
+        where_clause = f"({where_codes}) and {prix_field} is not null"
+        location_str = f"pour le(s) code(s) postal(aux) : {', '.join(codes)}"
+    else:
+        return "⚠️ Aucun emplacement défini. Utilisez le bouton en bas ou la commande /codes."
 
     params = {
         "where": where_clause,
@@ -213,25 +255,21 @@ def build_prices_message(codes, fuel_code):
     results = response.json().get("results", [])
 
     if not results:
-        codes_str = ", ".join(codes)
-        available = find_available_fuels(codes)
+        available = find_available_fuels(user)
 
         if available is None:
-            # La requête de vérification a échoué, on garde un message simple
-            return (
-                f"😕 Aucune station trouvée avec du *{fuel['label']}* "
-                f"pour le(s) code(s) postal(aux) : {codes_str}."
-            )
+            return f"😕 Aucune station trouvée avec du *{fuel['label']}* {location_str}."
 
         if not available:
             return (
-                f"😕 Aucune station-service référencée pour le(s) code(s) postal(aux) : "
-                f"{codes_str}.\nVérifiez le(s) code(s) postal(aux) ou essayez une ville voisine."
+                f"😕 Aucune station-service référencée {location_str}.\n\n"
+                f"💡 Si vous utilisez les codes postaux, n'hésitez pas à essayer une commune "
+                f"voisine disposant de zones commerciales."
             )
 
         autres = ", ".join(FUELS[c]["label"] for c in sorted(available))
         message = (
-            f"😕 Aucune station ne déclare de *{fuel['label']}* pour {codes_str} en ce moment.\n\n"
+            f"😕 Aucune station ne déclare de *{fuel['label']}* {location_str} en ce moment.\n\n"
             f"⛽ Carburants disponibles dans ce secteur : {autres}."
         )
         if fuel_code == "sp95":
@@ -252,8 +290,7 @@ def build_prices_message(codes, fuel_code):
         station_id = str(r.get("id") or "")
         info = brands.get(station_id)
         brand = info.get("brand") if info else None
-        if not info:
-            logger.info(f"No brand match for station id={station_id!r} ({adresse})")
+        
         prix_str = f"{prix:.3f}".replace(".", ",")
         marker = medals[i] if i < len(medals) else "▪️"
         prefix = f"{brand} — " if brand else ""
@@ -267,24 +304,85 @@ def build_prices_message(codes, fuel_code):
 
 WELCOME_MESSAGE = (
     "👋 *Bienvenue sur le bot Prix des Carburants !*\n\n"
-    "Ce bot vous permet de suivre les prix des carburants en France, "
-    "par code postal, grâce aux données officielles du gouvernement.\n\n"
-    "*Pour commencer :*\n"
-    "1️⃣ Définissez vos codes postaux avec /codes\n"
-    "   _Exemple :_ `/codes 44000 44600`\n"
-    "2️⃣ Choisissez votre carburant avec /carburant\n"
-    "3️⃣ Consultez les prix avec /prix\n\n"
-    "🔄 Pour réinitialiser vos codes postaux : /reset\n"
-    "❓ Pour revoir ces instructions : /aide"
+    "Ce bot vous aide à trouver les stations-services les moins chères autour de vous. "
+    "Pour commencer, configurez votre secteur géographique via l'une de ces deux options :\n\n"
+    "📍 *Option 1 : La géolocalisation (Recommandé)*\n"
+    "Cliquez sur le bouton « `📍 Envoyer ma position (ponctuel)` » juste en bas de votre écran.\n"
+    "_🔒 Vie privée : Il s'agit d'un partage unique (one-shot). Le bot utilise votre position instantanée "
+    "uniquement pour interroger l'API nationale, puis coupe le flux. Aucun historique ni suivi en arrière-plan._\n\n"
+    "📮 *Option 2 : Par Code Postal*\n"
+    "Si vous préférez, configurez vos zones manuellement.\n"
+    "⚠️ *Attention :* Entrez les codes postaux **des communes où se trouvent les stations-services** "
+    "(zones commerciales, grands axes) et pas forcément celui de votre domicile s'il s'agit d'un quartier purement résidentiel sans station !\n"
+    "_Exemple :_ `/codes 44000 44600`\n\n"
+    "Une fois la zone configurée :\n"
+    "1️⃣ Choisissez votre carburant avec /carburant\n"
+    "2️⃣ Consultez les prix les plus bas avec /prix\n\n"
+    "🔄 À tout moment, changez vos préférences en tapant /reset."
 )
 
 
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown")
+    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=welcome_keyboard())
 
 
 async def aide_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown")
+    await update.message.reply_text(WELCOME_MESSAGE, parse_mode="Markdown", reply_markup=welcome_keyboard())
+
+
+async def reset_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    user_id = str(update.effective_user.id)
+    if user_id in state:
+        state[user_id] = {"codes": [], "carburant": None, "lat": None, "lon": None, "radius": 10}
+        save_state(state)
+    await update.message.reply_text(
+        "🗑️ Vos préférences ont été réinitialisées.\n\n" + WELCOME_MESSAGE,
+        parse_mode="Markdown",
+        reply_markup=welcome_keyboard()
+    )
+
+
+async def handle_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Intercepte le partage GPS ponctuel et demande le rayon de recherche."""
+    lat = update.message.location.latitude
+    lon = update.message.location.longitude
+    
+    state = load_state()
+    user = get_user(state, str(update.effective_user.id))
+    
+    user["lat"] = lat
+    user["lon"] = lon
+    user["codes"] = []  # On vide les codes postaux pour prioriser le GPS
+    save_state(state)
+    
+    await update.message.reply_text(
+        "📍 *Position reçue avec succès !*\n"
+        "_(Le flux de géolocalisation est maintenant fermé)._\n\n"
+        "Pour affiner la recherche, choisissez le rayon maximal autour de vous :",
+        parse_mode="Markdown",
+        reply_markup=radius_keyboard()
+    )
+
+
+async def radius_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enregistre le rayon choisi par l'utilisateur."""
+    query = update.callback_query
+    await query.answer()
+    radius_val = int(query.data.replace("radius_", ""))
+
+    state = load_state()
+    user = get_user(state, str(update.effective_user.id))
+    user["radius"] = radius_val
+    save_state(state)
+
+    msg = f"✅ *Rayon de recherche fixé à {radius_val} km.*\n\n"
+    if not user["carburant"]:
+        msg += "👉 Étape suivante : Choisissez votre carburant avec /carburant."
+    else:
+        msg += "👉 Parfait ! Utilisez /prix pour voir les tarifs."
+
+    await query.edit_message_text(msg, parse_mode="Markdown")
 
 
 async def set_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -303,21 +401,23 @@ async def set_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     state = load_state()
     user = get_user(state, str(update.effective_user.id))
-    user["codes"] = user["codes"] + [c for c in valid if c not in user["codes"]]
+    
+    # On ajoute les nouveaux codes et on nettoie les données GPS obsolètes
+    user["codes"] = list(set(user["codes"] + valid))
+    user["lat"] = None
+    user["lon"] = None
     save_state(state)
 
     message = f"✅ Codes postaux enregistrés : {', '.join(user['codes'])}"
     if invalid:
         message += f"\n⚠️ Ignorés (invalides) : {', '.join(invalid)}"
+        
+    if not user["carburant"]:
+        message += "\n\n👉 Choisissez maintenant votre carburant avec /carburant."
+    else:
+        message += "\n\n👉 Utilisez /prix pour voir les tarifs."
+        
     await update.message.reply_text(message)
-
-
-async def reset_codes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    state = load_state()
-    user = get_user(state, str(update.effective_user.id))
-    user["codes"] = []
-    save_state(state)
-    await update.message.reply_text("🗑️ Vos codes postaux ont été réinitialisés.")
 
 
 async def choose_carburant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -347,13 +447,12 @@ async def fuel_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def prix_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     user = get_user(state, str(update.effective_user.id))
-    codes = user["codes"]
     fuel_code = user["carburant"]
 
-    if not codes:
+    if not user["codes"] and (user["lat"] is None or user["lon"] is None):
         await update.message.reply_text(
-            "⚠️ Vous n'avez pas encore défini de code postal.\n"
-            "Utilisez /codes, par exemple : `/codes 44000 44600`",
+            "⚠️ Vous n'avez pas encore défini votre localisation.\n"
+            "Utilisez le bouton en bas pour envoyer votre position ou configurez vos codes postaux avec /codes.",
             parse_mode="Markdown",
         )
         return
@@ -364,7 +463,7 @@ async def prix_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    message = build_prices_message(codes, fuel_code)
+    message = build_prices_message(user, fuel_code)
     await update.message.reply_text(message, parse_mode="Markdown", reply_markup=refresh_keyboard())
 
 
@@ -374,14 +473,13 @@ async def refresh_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     state = load_state()
     user = get_user(state, str(update.effective_user.id))
-    codes = user["codes"]
     fuel_code = user["carburant"]
 
-    if not codes or not fuel_code:
-        await query.answer("Configurez vos codes postaux et votre carburant d'abord.", show_alert=True)
+    if (not user["codes"] and (user["lat"] is None or user["lon"] is None)) or not fuel_code:
+        await query.answer("Configurez votre zone géographique et votre carburant d'abord.", show_alert=True)
         return
 
-    message = build_prices_message(codes, fuel_code)
+    message = build_prices_message(user, fuel_code)
 
     try:
         await query.edit_message_text(message, parse_mode="Markdown", reply_markup=refresh_keyboard())
@@ -389,7 +487,7 @@ async def refresh_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         if "Message is not modified" in str(e):
             await query.answer("Aucun changement depuis la dernière actualisation.")
         else:
-            raise
+            await query.answer("Erreur lors de la mise à jour des prix.", show_alert=True)
 
 
 async def fallback_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -400,12 +498,19 @@ async def fallback_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if valid:
         state = load_state()
         user = get_user(state, str(update.effective_user.id))
-        user["codes"] = user["codes"] + [c for c in valid if c not in user["codes"]]
+        user["codes"] = list(set(user["codes"] + valid))
+        user["lat"] = None
+        user["lon"] = None
         save_state(state)
 
         message = f"✅ Codes postaux enregistrés : {', '.join(user['codes'])}"
         if invalid:
             message += f"\n⚠️ Ignorés (invalides) : {', '.join(invalid)}"
+            
+        if not user["carburant"]:
+            message += "\n\n👉 Choisissez maintenant votre carburant avec /carburant."
+        else:
+            message += "\n\n👉 Utilisez /prix pour voir les tarifs."
         await update.message.reply_text(message)
     else:
         await update.message.reply_text(
@@ -430,8 +535,12 @@ def main() -> None:
     app.add_handler(CommandHandler("prix", prix_command))
 
     app.add_handler(CallbackQueryHandler(fuel_button, pattern="^fuel_"))
+    app.add_handler(CallbackQueryHandler(radius_button, pattern="^radius_"))
     app.add_handler(CallbackQueryHandler(refresh_button, pattern="^refresh$"))
 
+    # Handler pour la géolocalisation
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
+    # Handler pour le texte brut brut (fallback)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     logger.info("Bot started.")
