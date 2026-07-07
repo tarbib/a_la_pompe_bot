@@ -170,7 +170,7 @@ def find_available_fuels(user):
     params = {
         "where": where_clause,
         "select": f"id,{prix_fields}",
-        "limit": 15,
+        "limit": 10,
         "timezone": "Europe/Paris",
     }
 
