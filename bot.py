@@ -239,7 +239,7 @@ def build_prices_message(user, fuel_code):
         "where": where_clause,
         "select": f"id,cp,adresse,ville,{prix_field},{maj_field}",
         "order_by": f"{prix_field} ASC",
-        "limit": 100,
+        "limit": 15,
         "timezone": "Europe/Paris",
     }
 
